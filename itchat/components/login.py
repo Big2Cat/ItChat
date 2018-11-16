@@ -1,5 +1,5 @@
 import os, time, re, io
-import threading
+import threading, base64
 import json, xml.dom.minidom
 import random
 import traceback, logging
@@ -14,6 +14,7 @@ from pyqrcode import QRCode
 from .. import config, utils
 from ..returnvalues import ReturnValue
 from ..storage.templates import wrap_user_dict
+from ..signals import scan_qr_code, confirm_login, logged_in, logged_out
 from .contact import update_local_chatrooms, update_local_friends
 from .messages import produce_msg
 
@@ -48,9 +49,11 @@ def login(self, enableCmdQR=False, picDir=None, qrCallback=None,
             qrStorage = self.get_QR(enableCmdQR=enableCmdQR,
                 picDir=picDir, qrCallback=qrCallback)
             logger.info('Please scan the QR code to log in.')
+            encoded = base64.b64encode(qrStorage.getvalue()).decode('ascii')
+            scan_qr_code.send(self.uuid, extra=encoded, type='scan_qr_code')
         isLoggedIn = False
         while not isLoggedIn:
-            status = self.check_login()
+            status, extra = self.check_login()
             if hasattr(qrCallback, '__call__'):
                 qrCallback(uuid=self.uuid, status=status, qrcode=qrStorage.getvalue())
             if status == '200':
@@ -58,6 +61,7 @@ def login(self, enableCmdQR=False, picDir=None, qrCallback=None,
             elif status == '201':
                 if isLoggedIn is not None:
                     logger.info('Please press confirm on your phone.')
+                    confirm_login.send(self.uuid, extra=extra, type='confirm_login')
                     isLoggedIn = None
             elif status != '408':
                 break
@@ -78,6 +82,7 @@ def login(self, enableCmdQR=False, picDir=None, qrCallback=None,
         if os.path.exists(picDir or config.DEFAULT_QR):
             os.remove(picDir or config.DEFAULT_QR)
         logger.info('Login successfully as %s' % self.storageClass.nickName)
+        logged_in.send(self.uuid, type='logged_in')
     self.start_receiving(exitCallback)
     self.isLogging = False
 
@@ -113,15 +118,20 @@ def get_QR(self, uuid=None, enableCmdQR=False, picDir=None, qrCallback=None):
     qrCode = QRCode('https://login.weixin.qq.com/l/' + uuid)
     qrCode.png(qrStorage, scale=10)
     if hasattr(qrCallback, '__call__'):
-        qrCallback(uuid=uuid, status='0', qrcode=qrStorage.getvalue())
-    else:
-        with open(picDir, 'wb') as f:
-            f.write(qrStorage.getvalue())
-        if enableCmdQR:
-            utils.print_cmd_qr(qrCode.text(1), enableCmdQR=enableCmdQR)
+            qrCallback(uuid=uuid, status='0', qrcode=qrStorage.getvalue())
         else:
-            utils.print_qr(picDir)
-    return qrStorage
+            if enableCmdQR is None:
+                utils.print_cmd_qr(qrCode.text(1), enableCmdQR=2)
+                with open(picDir, 'wb') as f:
+                    f.write(qrStorage.getvalue())
+                utils.print_qr(picDir)
+            elif enableCmdQR:
+                utils.print_cmd_qr(qrCode.text(1), enableCmdQR=enableCmdQR)
+            else:
+                with open(picDir, 'wb') as f:
+                     f.write(qrStorage.getvalue())
+                 utils.print_qr(picDir)
+         return qrStorage
 
 def check_login(self, uuid=None):
     uuid = uuid or self.uuid
@@ -135,13 +145,15 @@ def check_login(self, uuid=None):
     data = re.search(regx, r.text)
     if data and data.group(1) == '200':
         if process_login_info(self, r.text):
-            return '200'
+            return '200', None
         else:
-            return '400'
+            return '400', None
     elif data:
-        return data.group(1)
+        avatar_regex = r'window.userAvatar = \'(.+)\';'
+        match = re.search(avatar_regex, r.text)
+        return data.group(1), match.group(1) if match else None
     else:
-        return '400'
+        return '400', None
 
 def process_login_info(core, loginContent):
     ''' when finish login (scanning qrcode)
@@ -278,6 +290,7 @@ def start_receiving(self, exitCallback=None, getReceivingFnOnly=False):
                 else:
                     time.sleep(1)
         self.logout()
+        logged_out.send(self.uuid, type='logged_out')
         if hasattr(exitCallback, '__call__'):
             exitCallback()
         else:
